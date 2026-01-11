@@ -24,6 +24,7 @@ experimental = ["esp-idf-svc/experimental"]
 [dependencies]
 log = "0.4"
 esp-idf-svc = "0.51"
+esp-idf-sys = "0.36.1"
 
 # --- Optional Embassy Integration ---
 # esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
@@ -41,6 +42,11 @@ esp-idf-svc = "0.51"
 # --- Temporary workaround for embassy-executor < 0.8 ---
 # esp-idf-svc = { version = "0.51", features = ["embassy-time-driver", "embassy-sync"] }
 # critical-section = { version = "1.1", features = ["std"], default-features = false }
+
+[[package.metadata.esp-idf-sys.extra_components]]
+component_dirs = "esp32-camera"
+bindings_header = "bindings.h"
+bindings_module = "camera"
 
 [build-dependencies]
 embuild = "0.33"
