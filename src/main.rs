@@ -1,10 +1,27 @@
-fn main() {
-    // It is necessary to call this function once. Otherwise, some patches to the runtime
-    // implemented by esp-idf-sys might not link properly. See https://github.com/esp-rs/esp-idf-template/issues/71
+use esp_idf_svc::espnow::{EspNow, PeerInfo, BROADCAST};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::prelude::Peripherals;
+use esp_idf_svc::wifi::{ClientConfiguration, Configuration, WifiDriver};
+
+fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
 
-    // Bind the log crate to the ESP Logging facilities
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    let peripherals = Peripherals::take()?;
+    let sysloop = EspSystemEventLoop::take()?;
+
+    let mut wifi = WifiDriver::new(peripherals.modem, sysloop.clone(), None)?;
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
+    wifi.start()?;
+
+    let espnow = EspNow::take()?;
+    espnow.add_peer(PeerInfo {
+        peer_addr: BROADCAST,
+        channel: 0,
+        encrypt: false,
+        ..Default::default()
+    })?;
 
     // M5Stack Unit Camera (OV2640) pin configuration
     // https://docs.m5stack.com/en/unit/Unit%20Camera#pinmap
@@ -26,12 +43,12 @@ fn main() {
         pin_vsync: 22,
         pin_href: 26,
         pin_pclk: 21,
-        xclk_freq_hz: 20000000,
+        xclk_freq_hz: 10000000,
         ledc_timer: esp_idf_sys::ledc_timer_t_LEDC_TIMER_0,
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
         frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_QQVGA,
-        jpeg_quality: 12,
+        jpeg_quality: 20,
         fb_count: 1,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_DRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
@@ -40,8 +57,9 @@ fn main() {
     unsafe {
         if esp_idf_sys::camera::esp_camera_init(&camera_config) != 0 {
             log::error!("camera init failed!");
-            return;
+            anyhow::bail!("camera init failed");
         } else {
+            espnow.send(BROADCAST, b"camera ready")?;
             log::info!("camera ready!");
         }
 
@@ -50,4 +68,6 @@ fn main() {
         let data = std::slice::from_raw_parts((*fb).buf, (*fb).len);
         // log::info!("{data:?}");
     }
+
+    Ok(())
 }
