@@ -8,20 +8,35 @@ use std::time::Duration;
 const FRAME_INTERVAL_MS: u64 = 100;
 const NOW_CHANNEL: u8 = 11;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum State {
+    Advertising,
+    Streaming,
+}
+
+enum Event {
+    Connect([u8; 6]),
+    Disconnect,
+}
+
 #[allow(dead_code)]
-mod protocol {
+pub mod protocol {
+    pub const PREFIX: [u8; 2] = [0xCA, 0x3E];
+
     pub const MSG_CAMERA_READY: u8 = 0x01;
     pub const MSG_CONNECT: u8 = 0x02;
     pub const MSG_FRAME_CHUNK: u8 = 0x03;
+    pub const MSG_DISCONNECT: u8 = 0x04;
 
-    // header: msg_type(1) + frame_id(2) + chunk_idx(2) + total_chunks(2) = 7 bytes
-    pub const CHUNK_HEADER_SIZE: usize = 7;
-    pub const CHUNK_DATA_SIZE: usize = 250 - CHUNK_HEADER_SIZE; // 243 bytes
+    // header: magic(2) + msg_type(1) + frame_id(2) + chunk_idx(2) + total_chunks(2) = 9 bytes
+    pub const CHUNK_HEADER_SIZE: usize = 9;
+    pub const CHUNK_DATA_SIZE: usize = 250 - CHUNK_HEADER_SIZE; // 241 bytes
 
     #[derive(Debug)]
     pub enum Message<'a> {
         CameraReady,
         Connect,
+        Disconnect,
         FrameChunk {
             frame_id: u16,
             chunk_idx: u16,
@@ -30,15 +45,19 @@ mod protocol {
         },
     }
 
-    pub fn decode_message(data: &[u8]) -> Option<Message<'_>> {
-        let msg_type = *data.first()?;
+    pub fn decode(data: &[u8]) -> Option<Message<'_>> {
+        if data.len() < 3 || data[0..2] != PREFIX {
+            return None;
+        }
+        let msg_type = data[2];
         match msg_type {
             MSG_CAMERA_READY => Some(Message::CameraReady),
             MSG_CONNECT => Some(Message::Connect),
+            MSG_DISCONNECT => Some(Message::Disconnect),
             MSG_FRAME_CHUNK if data.len() >= CHUNK_HEADER_SIZE => {
-                let frame_id = u16::from_le_bytes([data[1], data[2]]);
-                let chunk_idx = u16::from_le_bytes([data[3], data[4]]);
-                let total_chunks = u16::from_le_bytes([data[5], data[6]]);
+                let frame_id = u16::from_le_bytes([data[3], data[4]]);
+                let chunk_idx = u16::from_le_bytes([data[5], data[6]]);
+                let total_chunks = u16::from_le_bytes([data[7], data[8]]);
                 let payload = &data[CHUNK_HEADER_SIZE..];
                 Some(Message::FrameChunk {
                     frame_id,
@@ -49,6 +68,34 @@ mod protocol {
             }
             _ => None,
         }
+    }
+
+    pub fn encode_camera_ready() -> [u8; 3] {
+        [PREFIX[0], PREFIX[1], MSG_CAMERA_READY]
+    }
+
+    pub fn encode_connect() -> [u8; 3] {
+        [PREFIX[0], PREFIX[1], MSG_CONNECT]
+    }
+
+    pub fn encode_disconnect() -> [u8; 3] {
+        [PREFIX[0], PREFIX[1], MSG_DISCONNECT]
+    }
+
+    pub fn encode_frame_chunk(
+        frame_id: u16,
+        chunk_idx: u16,
+        total_chunks: u16,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(CHUNK_HEADER_SIZE + data.len());
+        packet.extend_from_slice(&PREFIX);
+        packet.push(MSG_FRAME_CHUNK);
+        packet.extend_from_slice(&frame_id.to_le_bytes());
+        packet.extend_from_slice(&chunk_idx.to_le_bytes());
+        packet.extend_from_slice(&total_chunks.to_le_bytes());
+        packet.extend_from_slice(data);
+        packet
     }
 }
 
@@ -82,13 +129,23 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     })?;
 
-    let (tx, rx) = mpsc::channel::<[u8; 6]>();
+    let (event_tx, event_rx) = mpsc::channel::<Event>();
+    let (send_done_tx, send_done_rx) = mpsc::sync_channel::<()>(1);
 
-    espnow.register_recv_cb(move |info, data| {
-        if data.first() == Some(&MSG_CONNECT) {
+    espnow.register_recv_cb(move |info, data| match decode(data) {
+        Some(Message::Connect) => {
             log::info!("Got connect from {:02X?}", info.src_addr);
-            let _ = tx.send(info.src_addr.clone());
+            let _ = event_tx.send(Event::Connect(*info.src_addr));
         }
+        Some(Message::Disconnect) => {
+            log::info!("Got disconnect from {:02X?}", info.src_addr);
+            let _ = event_tx.send(Event::Disconnect);
+        }
+        _ => {}
+    })?;
+
+    espnow.register_send_cb(move |_mac, _status| {
+        let _ = send_done_tx.try_send(());
     })?;
 
     // https://docs.m5stack.com/en/unit/Unit%20Camera#pinmap
@@ -115,8 +172,8 @@ fn main() -> anyhow::Result<()> {
         ledc_channel: esp_idf_sys::ledc_channel_t_LEDC_CHANNEL_0,
         pixel_format: esp_idf_sys::camera::pixformat_t_PIXFORMAT_JPEG,
         frame_size: esp_idf_sys::camera::framesize_t_FRAMESIZE_QQVGA,
-        jpeg_quality: 20,
-        fb_count: 1,
+        jpeg_quality: 15,
+        fb_count: 2,
         fb_location: esp_idf_sys::camera::camera_fb_location_t_CAMERA_FB_IN_DRAM,
         grab_mode: esp_idf_sys::camera::camera_grab_mode_t_CAMERA_GRAB_WHEN_EMPTY,
     };
@@ -127,55 +184,70 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    log::info!("Camera ready, waiting for client...");
-
-    // wait connection
-    let client_mac = loop {
-        espnow.send(BROADCAST, &[MSG_CAMERA_READY])?;
-
-        match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(mac) => break mac,
-            Err(_) => continue,
-        }
-    };
-
-    espnow.add_peer(PeerInfo {
-        peer_addr: client_mac,
-        channel: NOW_CHANNEL,
-        encrypt: false,
-        ..Default::default()
-    })?;
-    log::info!("Client connected: {:02X?}", client_mac);
-
-    // send frames
+    let mut state = State::Advertising;
+    let mut client_mac: Option<[u8; 6]> = None;
     let mut frame_id: u16 = 0;
 
+    log::info!("Camera initialized, entering main loop");
+
     loop {
-        let fb = unsafe { esp_idf_sys::camera::esp_camera_fb_get() };
-        if fb.is_null() {
-            log::warn!("Failed to get frame");
-            continue;
-        }
+        match state {
+            State::Advertising => {
+                log::info!("Advertising...");
+                espnow.send(BROADCAST, &encode_camera_ready())?;
 
-        let data = unsafe { std::slice::from_raw_parts((*fb).buf, (*fb).len) };
-        let total_chunks = (data.len() + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE;
+                match event_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Event::Connect(mac)) => {
+                        espnow.add_peer(PeerInfo {
+                            peer_addr: mac,
+                            channel: NOW_CHANNEL,
+                            encrypt: false,
+                            ..Default::default()
+                        })?;
+                        client_mac = Some(mac);
+                        frame_id = 0;
+                        state = State::Streaming;
+                        log::info!("Client connected: {:02X?}", mac);
+                    }
+                    _ => {}
+                }
+            }
 
-        for (chunk_idx, chunk) in data.chunks(CHUNK_DATA_SIZE).enumerate() {
-            let mut packet = Vec::with_capacity(CHUNK_HEADER_SIZE + chunk.len());
-            packet.push(MSG_FRAME_CHUNK);
-            packet.extend_from_slice(&frame_id.to_le_bytes());
-            packet.extend_from_slice(&(chunk_idx as u16).to_le_bytes());
-            packet.extend_from_slice(&(total_chunks as u16).to_le_bytes());
-            packet.extend_from_slice(chunk);
+            State::Streaming => {
+                if let Ok(Event::Disconnect) = event_rx.try_recv() {
+                    if let Some(mac) = client_mac.take() {
+                        let _ = espnow.del_peer(mac);
+                    }
+                    state = State::Advertising;
+                    log::info!("Client disconnected, returning to advertising");
+                    continue;
+                }
 
-            if let Err(e) = espnow.send(client_mac, &packet) {
-                log::warn!("Send failed: {:?}", e);
+                let mac = client_mac.unwrap();
+
+                let fb = unsafe { esp_idf_sys::camera::esp_camera_fb_get() };
+                if fb.is_null() {
+                    log::warn!("Failed to get frame");
+                    continue;
+                }
+
+                let data = unsafe { std::slice::from_raw_parts((*fb).buf, (*fb).len) };
+                let total_chunks = (data.len() + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE;
+
+                for (chunk_idx, chunk) in data.chunks(CHUNK_DATA_SIZE).enumerate() {
+                    let packet =
+                        encode_frame_chunk(frame_id, chunk_idx as u16, total_chunks as u16, chunk);
+                    if let Err(e) = espnow.send(mac, &packet) {
+                        log::warn!("Send failed: {:?}", e);
+                    }
+                    let _ = send_done_rx.recv();
+                }
+
+                unsafe { esp_idf_sys::camera::esp_camera_fb_return(fb) };
+
+                frame_id = frame_id.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(FRAME_INTERVAL_MS));
             }
         }
-
-        unsafe { esp_idf_sys::camera::esp_camera_fb_return(fb) };
-
-        frame_id = frame_id.wrapping_add(1);
-        std::thread::sleep(Duration::from_millis(FRAME_INTERVAL_MS));
     }
 }
